@@ -219,6 +219,10 @@ class ParallelInterleaveDatasetOp::Dataset : public DatasetBase {
         ParallelInterleaveDatasetOp::kDatasetType, params);
   }
 
+  int64 Parallelism() const override {
+    return num_parallel_calls_;
+  }
+
   Status CheckExternalState() const override {
     TF_RETURN_IF_ERROR(captured_func_->CheckExternalState());
     return input_->CheckExternalState();
@@ -336,6 +340,7 @@ class ParallelInterleaveDatasetOp::Dataset : public DatasetBase {
       ctx_ = std::make_unique<IteratorContext>(*ctx);
       TF_RETURN_IF_ERROR(
           dataset()->input_->MakeIterator(ctx, this, prefix(), &input_impl_));
+      RecordParallelism(ctx);
       return dataset()->captured_func_->Instantiate(
           ctx, &instantiated_captured_func_);
     }

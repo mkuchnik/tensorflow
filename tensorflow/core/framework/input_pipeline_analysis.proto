@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package tensorflow;
+
+import "tensorflow/core/framework/graph.proto";
+
+// A snapshot of data pipeline activity
+message PipelineSnapshot {
+  optional GraphDef graph = 1;
+
+  // A snapshot of per-op activity
+  message OpStats {
+    int64 elements_produced = 1;
+    int64 wallclock_time = 2;
+    int64 processing_time = 3;
+    int64 parallelism = 4;
+    double element_ratio = 5;
+    string name = 6;
+    int64 count = 7;
+    int64 bytes_produced = 8;
+    int64 bytes_consumed = 9;
+    int64 processing_time_clock = 10;
+    int64 estimated_dataset_size = 11;
+    // TODO(mkuchnik) Memory touched
+    // TODO(mkuchnik) Stats aggregator
+  }
+
+  repeated OpStats stats = 2;
+
+  // Machine statistics
+  message MachineInfo {
+    int64 num_cores = 1;
+    int64 memory_free = 2;
+    int64 memory_total = 3;
+  }
+
+  MachineInfo machine_info = 3;
+
+  message CtxInfo {
+    int64 shared_threadpool_size = 1;  // Non-blocking functions
+    int64 udf_threadpool_size = 2;  // User defined functions
+  }
+
+  CtxInfo ctx_info = 4;
+
+  message IteratorStats {
+    double avg_duration = 1;
+    double var_duration = 2;
+    double avg_wallclock_duration = 3;
+  }
+
+  IteratorStats iter_stats = 5;
+}
+
+

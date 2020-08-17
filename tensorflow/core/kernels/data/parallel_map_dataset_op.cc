@@ -111,6 +111,10 @@ class ParallelMapDatasetOp::Dataset : public DatasetBase {
                                           params);
   }
 
+  int64 Parallelism() const override {
+    return num_parallel_calls_;
+  }
+
   int64 Cardinality() const override {
     if (preserve_cardinality_) {
       return input_->Cardinality();
@@ -220,6 +224,7 @@ class ParallelMapDatasetOp::Dataset : public DatasetBase {
           [this]() { CancelThreads(/*wait=*/false); }, &deregister_fn_));
       TF_RETURN_IF_ERROR(
           dataset()->input_->MakeIterator(ctx, this, prefix(), &input_impl_));
+      RecordParallelism(ctx);
       return dataset()->captured_func_->Instantiate(
           ctx, &instantiated_captured_func_);
     }

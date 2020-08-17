@@ -93,6 +93,7 @@ from __future__ import division
 from __future__ import print_function
 
 # pylint: disable=unused-import
+from tensorflow.python.data.experimental import analysis
 from tensorflow.python.data.experimental import service
 from tensorflow.python.data.experimental.ops.batching import dense_to_ragged_batch
 from tensorflow.python.data.experimental.ops.batching import dense_to_sparse_batch
@@ -160,6 +161,7 @@ from tensorflow.python.framework.type_spec import TypeSpec as Structure
 from tensorflow.python.util.all_util import remove_undocumented
 
 _allowed_symbols = [
+    "analysis",
     "service",
 ]
 

@@ -348,7 +348,24 @@ Status IteratorBase::InitializeBase(IteratorContext* ctx,
     auto factory = [ctx, this](model::Node::Args args) {
       return CreateNode(ctx, std::move(args));
     };
-    model->AddNode(std::move(factory), prefix(), parent->model_node(), &node_);
+    // Push dataset_name for modeling per-dataset resources
+    DatasetBaseIterator* cast_iter = dynamic_cast<DatasetBaseIterator*>(this);
+    const string dataset_name(
+        cast_iter->dataset()->node_name());  // NOTE(mkuchnik): This is not
+                                             // consistent with graphdef
+    const GraphDef& dataset_graph_def = cast_iter->dataset()->graph_def_;
+    if (cast_iter->dataset()->is_root_ && dataset_graph_def.IsInitialized()) {
+      // NOTE(mkuchnik): To make consistent, we have to copy the newest graphdef
+      VLOG(3) << "Initializing graph_def for model from "
+                << cast_iter->dataset()->node_name() << " with "
+                << dataset_graph_def.DebugString();
+      model->graph_def_.CopyFrom(dataset_graph_def);
+    }
+    VLOG(3) << "Adding dataset_name " << cast_iter->dataset()->DebugString()
+            << " " << cast_iter->dataset()->node_name();
+    model->AddNode(std::move(factory), prefix(), parent->model_node(), &node_,
+                   dataset_name, cast_iter->dataset()->Parallelism(),
+                   cast_iter->dataset()->EstimatedDatasetSizeBytes());
     cleanup_fns_.push_back([this, model]() { model->RemoveNode(node_); });
   }
   return Status::OK();

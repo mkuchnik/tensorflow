@@ -42,8 +42,8 @@ class InterleaveMany : public Node {
  protected:
   std::shared_ptr<Node> Clone(std::shared_ptr<Node> output) const override
       TF_SHARED_LOCKS_REQUIRED(mu_) {
-    return std::make_shared<InterleaveMany>(
-        Args{id_, name_, std::move(output)});
+    return std::make_shared<InterleaveMany>(Args{
+        id_, name_, std::move(output), model_, dataset_name_, parallelism_});
   }
 
   void InputTimeLocked(absl::flat_hash_map<string, double>* input_times)
@@ -166,7 +166,9 @@ class AsyncInterleaveMany : public Node {
       parameters.push_back(pair.second);
     }
     return std::make_shared<AsyncInterleaveMany>(
-        Args{id_, name_, std::move(output)}, parameters);
+        Args{id_, name_, std::move(output), model_, dataset_name_,
+             parallelism_},
+        parameters);
   }
 
   void InputTimeLocked(absl::flat_hash_map<string, double>* input_times)
@@ -309,8 +311,10 @@ class KnownRatio : public Node {
  protected:
   std::shared_ptr<Node> Clone(std::shared_ptr<Node> output) const override
       TF_SHARED_LOCKS_REQUIRED(mu_) {
-    return std::make_shared<KnownRatio>(Args{id_, name_, std::move(output)},
-                                        ratio_);
+    return std::make_shared<KnownRatio>(
+        Args{id_, name_, std::move(output), model_, dataset_name_,
+             parallelism_},
+        ratio_);
   }
 
   // The input time is the sum of inherited input time and self processing time,
@@ -385,6 +389,10 @@ class KnownRatio : public Node {
         self_processing_time + inputs_processing_time;
   }
 
+  double ElementRatio() const override TF_SHARED_LOCKS_REQUIRED(mu_) {
+    return ratio_;
+  }
+
  private:
   const double ratio_;
 };
@@ -409,7 +417,9 @@ class AsyncKnownRatio : public Node {
       parameters.push_back(pair.second);
     }
     return std::make_shared<AsyncKnownRatio>(
-        Args{id_, name_, std::move(output)}, ratio_, parameters);
+        Args{id_, name_, std::move(output), model_, dataset_name_,
+             parallelism_},
+        ratio_, parameters);
   }
 
   // The input time is the sum of inherited input time and parallelism adjusted
@@ -565,6 +575,10 @@ class AsyncKnownRatio : public Node {
         self_processing_time + inputs_processing_time;
   }
 
+  double ElementRatio() const override TF_SHARED_LOCKS_REQUIRED(mu_) {
+    return ratio_;
+  }
+
  private:
   const double ratio_;
 };
@@ -578,7 +592,8 @@ class UnknownRatio : public Node {
  protected:
   std::shared_ptr<Node> Clone(std::shared_ptr<Node> output) const override
       TF_SHARED_LOCKS_REQUIRED(mu_) {
-    return std::make_shared<UnknownRatio>(Args{id_, name_, std::move(output)});
+    return std::make_shared<UnknownRatio>(Args{
+        id_, name_, std::move(output), model_, dataset_name_, parallelism_});
   }
 
   // The input time is the sum of inherited input time and self processing time,
@@ -677,7 +692,8 @@ class Unknown : public Node {
  protected:
   std::shared_ptr<Node> Clone(std::shared_ptr<Node> output) const override
       TF_SHARED_LOCKS_REQUIRED(mu_) {
-    return std::make_shared<Unknown>(Args{id_, name_, std::move(output)});
+    return std::make_shared<Unknown>(Args{id_, name_, std::move(output), model_,
+                                          dataset_name_, parallelism_});
   }
 
   // The input time is the inherited input time.
@@ -722,6 +738,7 @@ class Unknown : public Node {
 }  // namespace
 
 thread_local int64 Node::work_start_;
+thread_local timespec Node::work_start_clock_;
 
 std::shared_ptr<Parameter> MakeParameter(const string& name,
                                          std::shared_ptr<SharedState> state,
@@ -1031,6 +1048,55 @@ double Node::TotalProcessingTime(
   return total_processing_times[long_name()];
 }
 
+void reduce_stats(
+    absl::flat_hash_map<string, std::shared_ptr<Node_Stats>>& production_stats,
+    const string& name_key, const Node_Stats& stats) {
+  // Add prior stats to new stats if exists, otherwise use new stats
+  // We ignore low production nodes, as they are ephemeral
+  const auto keep_threshold = 10;  // TODO(mkuchnik): This is hacky
+  auto pos = production_stats.find(name_key);
+  if (stats.elements_produced < keep_threshold) {
+    return;
+  }
+  if (pos != production_stats.end()) {
+    if ( production_stats[name_key]->elements_produced > keep_threshold ) {
+      production_stats[name_key]->elements_produced += stats.elements_produced;
+      production_stats[name_key]->wallclock_time += stats.wallclock_time;
+      production_stats[name_key]->processing_time += stats.processing_time;
+      production_stats[name_key]->parallelism += stats.parallelism;
+      production_stats[name_key]->count += stats.count;
+      production_stats[name_key]->bytes_produced += stats.bytes_produced;
+      production_stats[name_key]->bytes_consumed += stats.bytes_consumed;
+      production_stats[name_key]->processing_time_clock +=
+          stats.processing_time_clock;
+      production_stats[name_key]->estimated_dataset_size +=
+          stats.estimated_dataset_size;
+    } else {
+      if (production_stats[name_key]->elements_produced <
+          stats.elements_produced) {
+        production_stats[name_key] = std::make_shared<Node_Stats>(stats);
+      }
+    }
+  } else {
+    production_stats[name_key] = std::make_shared<Node_Stats>(stats);
+  }
+}
+
+void Node::CollectProductionStats(
+    absl::flat_hash_map<string, std::shared_ptr<Node_Stats>>& production_stats,
+    int64 time_nanos) {
+  tf_shared_lock l(mu_);
+
+  for (const auto& node : CollectNodes(TraversalOrder::REVERSE_BFS)) {
+    const Node_Stats stats = node->Stats(time_nanos);
+    const string& name_key = node->dataset_name();
+    reduce_stats(production_stats, name_key, stats);
+  }
+  const Node_Stats stats = Stats(time_nanos);
+  const string& name_key = dataset_name();
+  reduce_stats(production_stats, name_key, stats);
+}
+
 double Node::AverageBufferedElementSize() const {
   if (buffered_elements_ == 0) {
     return 0;
@@ -1155,6 +1221,8 @@ void Node::DebugStringHelper(absl::flat_hash_map<string, string>* debug_strings)
     const TF_SHARED_LOCKS_REQUIRED(mu_) {
   string result;
   strings::StrAppend(&result, long_name(), ":\n");
+  strings::StrAppend(&result, "  dataset=", dataset_name(), "\n");
+  strings::StrAppend(&result, "  parallelism=", parallelism_.load(), "\n");
   strings::StrAppend(&result, "  autotune=", autotune_.load(), "\n");
   strings::StrAppend(&result, "  buffered_bytes=", buffered_bytes_.load(),
                      "\n");
@@ -1166,6 +1234,11 @@ void Node::DebugStringHelper(absl::flat_hash_map<string, string>* debug_strings)
                      "\n");
   strings::StrAppend(&result, "  processing_time=", processing_time_.load(),
                      "\n");
+  strings::StrAppend(
+      &result, "  processing_time_clock=", processing_time_clock_.load(), "\n");
+  strings::StrAppend(&result, "  estimated_dataset_size=",
+                     estimated_dataset_size_.load(), "\n");
+  strings::StrAppend(&result, "  start_time=", start_time_.load(), "\n");
   strings::StrAppend(&result, "  num_elements=", num_elements_.load(), "\n");
   string inputs;
   for (auto& input : inputs_) {
@@ -1195,6 +1268,9 @@ std::shared_ptr<Node> Node::SnapshotHelper(
     cloned_current->num_elements_.store(num_elements_);
     cloned_current->record_metrics_.store(false);
     cloned_current->processing_time_.store(processing_time_);
+    cloned_current->processing_time_clock_.store(processing_time_clock_);
+    cloned_current->estimated_dataset_size_.store(estimated_dataset_size_);
+    cloned_current->start_time_.store(start_time_);
     mutex_lock l2(cloned_current->mu_);
     cloned_current->parameters_ = parameters_;
   }
@@ -1251,12 +1327,16 @@ void Node::TotalMaximumBufferedBytesHelper(
 
 void Model::AddNode(Node::Factory factory, const string& name,
                     std::shared_ptr<Node> parent,
-                    std::shared_ptr<Node>* out_node) {
+                    std::shared_ptr<Node>* out_node, const string& dataset_name,
+                    const int64 parallelism,
+                    const int64 estimated_dataset_size) {
   // The name captures the sequence of iterators joined by `::`. We only use the
   // last element of the sequence as the name node.
   auto node_name = str_util::Split(name, ':', str_util::SkipEmpty()).back();
   mutex_lock l(mu_);
-  std::shared_ptr<Node> node = factory({id_counter_++, node_name, parent});
+  std::shared_ptr<Node> node =
+      factory({id_counter_++, node_name, parent, this, dataset_name,
+               parallelism, estimated_dataset_size});
   if (!output_) {
     output_ = node;
   }
@@ -1315,6 +1395,14 @@ Model::CollectTunableParameters(std::shared_ptr<Node> node) {
   absl::flat_hash_map<string, std::shared_ptr<Parameter>> parameters;
   node->CollectTunableParameters(&parameters);
   return parameters;
+}
+
+absl::flat_hash_map<string, std::shared_ptr<Node_Stats>>
+Model::CollectProductionStatsInternal(std::shared_ptr<Node> node,
+                                      int64 time_nanos) {
+  absl::flat_hash_map<string, std::shared_ptr<Node_Stats>> stats;
+  node->CollectProductionStats(stats, time_nanos);
+  return stats;
 }
 
 absl::flat_hash_map<string, std::shared_ptr<Parameter>>
@@ -1415,6 +1503,18 @@ void Model::OptimizeGradientDescent(int64 cpu_budget, int64 ram_budget,
     parameter->state->value = parameter->value;
     parameter->state->cond_var->notify_all();
   }
+}
+
+absl::flat_hash_map<string, std::shared_ptr<Node_Stats>>
+Model::CollectProductionStats(int64 time_nanos) {
+  std::shared_ptr<Node> snapshot;
+  {
+    tf_shared_lock lock(mu_);
+    snapshot = output_->Snapshot();
+  }
+  absl::flat_hash_map<string, std::shared_ptr<Node_Stats>> stats =
+      CollectProductionStatsInternal(snapshot, time_nanos);
+  return stats;
 }
 
 void Model::OptimizeHillClimb(int64 cpu_budget, int64 ram_budget,
