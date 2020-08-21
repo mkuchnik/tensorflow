@@ -11,6 +11,7 @@ py_library(
     srcs_version = "PY2AND3",
     deps = [
         "//tensorflow/python:util",
+        "//tensorflow/python/data/experimental/analysis",
         "//tensorflow/python/data/experimental/ops:dataset_ops",
         "//tensorflow/python/data/experimental/ops:iterator_ops",
         "//tensorflow/python/data/experimental/service",

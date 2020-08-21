@@ -30,7 +30,6 @@ from six.moves import queue as Queue  # pylint: disable=redefined-builtin
 
 from tensorflow.core.framework import graph_pb2
 from tensorflow.python import tf2
-from tensorflow.python.compat import compat
 from tensorflow.python.data.experimental.ops import distribute_options
 from tensorflow.python.data.experimental.ops import optimization_options
 from tensorflow.python.data.experimental.ops import stats_options
@@ -393,10 +392,11 @@ class DatasetV2(collections_abc.Iterable, tracking_base.Trackable,
                                  graph_rewrites.default, graph_rewrite_configs)
 
     # (3) Apply autotune options
-    autotune, algorithm, cpu_budget = options._autotune_settings()  # pylint: disable=protected-access
+    (autotune, algorithm, cpu_budget,
+     stats_filename) = options._autotune_settings()  # pylint: disable=protected-access
 
     if autotune:
-      dataset = _ModelDataset(dataset, algorithm, cpu_budget)
+      dataset = _ModelDataset(dataset, algorithm, cpu_budget, stats_filename)
 
     # (4) Apply stats aggregator options
     if options.experimental_stats and options.experimental_stats.aggregator:  # pylint: disable=line-too-long
@@ -472,8 +472,8 @@ class DatasetV2(collections_abc.Iterable, tracking_base.Trackable,
     output_shapes = str(output_shapes).replace("'", "")
     output_types = nest.map_structure(repr, get_legacy_output_types(self))
     output_types = str(output_types).replace("'", "")
-    return ("<%s shapes: %s, types: %s>" % (type(self).__name__, output_shapes,
-                                            output_types))
+    return ("<%s shapes: %s, types: %s>" %
+            (type(self).__name__, output_shapes, output_types))
 
   def as_numpy_iterator(self):
     """Returns an iterator which converts all elements of the dataset to numpy.
@@ -4430,12 +4430,13 @@ class _OptionsDataset(UnaryUnchangedStructureDataset):
 class _ModelDataset(UnaryUnchangedStructureDataset):
   """A `Dataset` that acts as an identity, and models performance."""
 
-  def __init__(self, input_dataset, algorithm, cpu_budget):
+  def __init__(self, input_dataset, algorithm, cpu_budget, stats_filename):
     self._input_dataset = input_dataset
     variant_tensor = gen_dataset_ops.model_dataset(
         input_dataset._variant_tensor,  # pylint: disable=protected-access
         algorithm=algorithm.value,
         cpu_budget=cpu_budget,
+        stats_filename=stats_filename,
         **self._flat_structure)
     super(_ModelDataset, self).__init__(input_dataset, variant_tensor)
 
@@ -4453,45 +4454,30 @@ class _OptimizeDataset(UnaryUnchangedStructureDataset):
     if optimization_configs is None:
       optimization_configs = []
 
-    if compat.forward_compatible(2020, 8, 6):
-      self._optimizations_enabled = convert.optional_param_to_tensor(
-          argument_name="optimizations_enabled",
-          argument_value=optimizations_enabled,
-          argument_default=[],
-          argument_dtype=dtypes.string)
-      self._optimizations_disabled = convert.optional_param_to_tensor(
-          argument_name="optimizations_disabled",
-          argument_value=optimizations_disabled,
-          argument_default=[],
-          argument_dtype=dtypes.string)
-      self._optimizations_default = convert.optional_param_to_tensor(
-          argument_name="optimizations_default",
-          argument_value=optimizations_default,
-          argument_default=[],
-          argument_dtype=dtypes.string)
+    self._optimizations_enabled = convert.optional_param_to_tensor(
+        argument_name="optimizations_enabled",
+        argument_value=optimizations_enabled,
+        argument_default=[],
+        argument_dtype=dtypes.string)
+    self._optimizations_disabled = convert.optional_param_to_tensor(
+        argument_name="optimizations_disabled",
+        argument_value=optimizations_disabled,
+        argument_default=[],
+        argument_dtype=dtypes.string)
+    self._optimizations_default = convert.optional_param_to_tensor(
+        argument_name="optimizations_default",
+        argument_value=optimizations_default,
+        argument_default=[],
+        argument_dtype=dtypes.string)
 
-      variant_tensor = gen_dataset_ops.optimize_dataset_v2(
-          input_dataset._variant_tensor,  # pylint: disable=protected-access
-          self._optimizations_enabled,
-          self._optimizations_disabled,
-          self._optimizations_default,
-          optimization_configs=optimization_configs,
-          **self._flat_structure)
-    else:
-      if optimizations_enabled is None:
-        optimizations_enabled = []
-      if optimizations_default is None:
-        optimizations_default = []
+    variant_tensor = gen_dataset_ops.optimize_dataset_v2(
+        input_dataset._variant_tensor,  # pylint: disable=protected-access
+        self._optimizations_enabled,
+        self._optimizations_disabled,
+        self._optimizations_default,
+        optimization_configs=optimization_configs,
+        **self._flat_structure)
 
-      self._optimizations = ops.convert_to_tensor(
-          optimizations_enabled + optimizations_default,
-          dtype=dtypes.string,
-          name="optimizations")
-      variant_tensor = gen_dataset_ops.optimize_dataset(
-          input_dataset._variant_tensor,  # pylint: disable=protected-access
-          self._optimizations,
-          optimization_configs=optimization_configs,
-          **self._flat_structure)
     super(_OptimizeDataset, self).__init__(input_dataset, variant_tensor)
 
 

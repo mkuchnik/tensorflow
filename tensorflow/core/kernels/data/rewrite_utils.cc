@@ -176,6 +176,10 @@ Status RewriteDataset(OpKernelContext* ctx, const DatasetBase* input,
       graph_runner.Run(&graph, flr, input_list, {output_node}, &outputs));
   TF_RETURN_IF_ERROR(GetDatasetFromVariantTensor(outputs[0], rewritten_input));
   (*rewritten_input)->Ref();
+  graph.ToGraphDef(&graph_def);  // This preserves view of graphdef
+  // We need the same view of the graph_def as is used here, so send to input
+  // Input can then send to model if it exists
+  (*rewritten_input)->propagate_graphdef_update(graph_def);
 
   if (record_fingerprint) {
     (*ctx->runner())([graph_def = std::move(graph_def),

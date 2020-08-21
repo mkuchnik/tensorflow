@@ -348,7 +348,24 @@ Status IteratorBase::InitializeBase(IteratorContext* ctx,
     auto factory = [ctx, this](model::Node::Args args) {
       return CreateNode(ctx, std::move(args));
     };
-    model->AddNode(std::move(factory), prefix(), parent->model_node(), &node_);
+    // Push dataset_name for modeling per-dataset resources
+    DatasetBaseIterator* cast_iter = dynamic_cast<DatasetBaseIterator*>(this);
+    const string dataset_name(
+        cast_iter->dataset()->node_name());  // NOTE(mkuchnik): This is not
+                                             // consistent with graphdef
+    const GraphDef& dataset_graph_def = cast_iter->dataset()->graph_def_;
+    if (cast_iter->dataset()->is_root_ && dataset_graph_def.IsInitialized()) {
+      // NOTE(mkuchnik): To make consistent, we have to copy the newest graphdef
+      VLOG(3) << "Initializing graph_def for model from "
+                << cast_iter->dataset()->node_name() << " with "
+                << dataset_graph_def.DebugString();
+      model->graph_def_.CopyFrom(dataset_graph_def);
+    }
+    VLOG(3) << "Adding dataset_name " << cast_iter->dataset()->DebugString()
+            << " " << cast_iter->dataset()->node_name();
+    model->AddNode(std::move(factory), prefix(), parent->model_node(), &node_,
+                   dataset_name, cast_iter->dataset()->Parallelism(),
+                   cast_iter->dataset()->EstimatedDatasetSizeBytes());
     cleanup_fns_.push_back([this, model]() { model->RemoveNode(node_); });
   }
   return Status::OK();
@@ -552,6 +569,64 @@ Status DatasetBaseIterator::GetNext(IteratorContext* ctx,
   }
   DVLOG(3) << prefix() << " GetNext exit";
   return s;
+}
+
+Status DatasetBaseIterator::Skip(IteratorContext* ctx, int num_to_skip,
+                                 bool* end_of_sequence, int* num_skipped) {
+  profiler::TraceMe activity([&] { return BuildTraceMeName(); },
+                             profiler::TraceMeLevel::kInfo);
+  DVLOG(3) << prefix() << " Skip enter";
+  auto model = ctx->model();
+  if (model && model->collect_resource_usage() && node_) {
+    int64 now_nanos = EnvTime::NowNanos();
+    auto output = node_->output();
+    if (output) {
+      output->record_stop(now_nanos);
+    }
+    node_->record_start(now_nanos);
+  }
+  Status s = SkipInternal(ctx, num_to_skip, end_of_sequence, num_skipped);
+  if (model && model->collect_resource_usage() && node_) {
+    int64 now_nanos = EnvTime::NowNanos();
+    node_->record_stop(now_nanos);
+    auto output = node_->output();
+    if (output) {
+      output->record_start(now_nanos);
+    }
+  }
+  if (TF_PREDICT_FALSE(errors::IsOutOfRange(s))) {
+    s = errors::Internal("Iterator \"", params_.prefix,
+                         "\" returned `OutOfRange`. This indicates an "
+                         "implementation error as `OutOfRange` errors are not "
+                         "expected to be returned here. Original message: ",
+                         s.error_message());
+    LOG(ERROR) << s;
+  }
+  DVLOG(3) << prefix() << " Skip exit";
+  return s;
+}
+
+Status DatasetBaseIterator::SkipInternal(IteratorContext* ctx, int num_to_skip,
+                                         bool* end_of_sequence,
+                                         int* num_skipped) {
+  *num_skipped = 0;
+  for (int i = 0; i < num_to_skip; ++i) {
+    std::vector<Tensor> out_tensors;
+    TF_RETURN_IF_ERROR(GetNextInternal(ctx, &out_tensors, end_of_sequence));
+    if (*end_of_sequence) {
+      return Status::OK();
+    }
+    // RecordElement is used to count the number of element computed and
+    // help calculate the CPU time spent on a given iterator to do the
+    // autotuning.
+    // Here we only call RecordElement in the default implementation of
+    // SkipInternal (which trivially calls GetNextInternal) and assume
+    // that the overriden SkipInternal in the derived class will have
+    // negligible cost compare to its GetNextInternal.
+    RecordElement(ctx, &out_tensors);
+    (*num_skipped)++;
+  }
+  return Status::OK();
 }
 
 void DatasetOpKernel::Compute(OpKernelContext* ctx) {

@@ -14,6 +14,8 @@ limitations under the License.
 ==============================================================================*/
 #include "tensorflow/core/kernels/data/tf_record_dataset_op.h"
 
+#include <sys/stat.h>
+
 #include "tensorflow/core/common_runtime/metrics.h"
 #include "tensorflow/core/framework/partial_tensor_shape.h"
 #include "tensorflow/core/framework/tensor.h"
@@ -58,9 +60,19 @@ class TFRecordDatasetOp::Dataset : public DatasetBase {
         filenames_(std::move(filenames)),
         compression_type_(compression_type),
         options_(io::RecordReaderOptions::CreateRecordReaderOptions(
-            compression_type)) {
+            compression_type)),
+        estimated_dataset_size_(-1) {
     if (buffer_size > 0) {
       options_.buffer_size = buffer_size;
+    }
+    if (!filenames_.empty()) {
+      struct stat stat_buf;
+      auto test_file = filenames_.at(0);
+      int rc = stat(test_file.c_str(), &stat_buf);
+      if (!rc) {
+        // TODO(mkuchnik): filenames is often single.
+        estimated_dataset_size_ = stat_buf.st_size * filenames_.size();
+      }
     }
   }
 
@@ -83,6 +95,10 @@ class TFRecordDatasetOp::Dataset : public DatasetBase {
 
   string DebugString() const override {
     return name_utils::DatasetDebugString(kDatasetType);
+  }
+
+  int64 EstimatedDatasetSizeBytes() const override {
+    return estimated_dataset_size_;
   }
 
   Status CheckExternalState() const override { return Status::OK(); }
@@ -111,6 +127,7 @@ class TFRecordDatasetOp::Dataset : public DatasetBase {
     Status GetNextInternal(IteratorContext* ctx,
                            std::vector<Tensor>* out_tensors,
                            bool* end_of_sequence) override {
+      RecordEstimatedDatasetSizeBytes(ctx);
       out_tensors->reserve(1);
       mutex_lock l(mu_);
       do {
@@ -123,8 +140,12 @@ class TFRecordDatasetOp::Dataset : public DatasetBase {
           if (s.ok()) {
             static monitoring::CounterCell* bytes_counter =
                 metrics::GetTFDataBytesReadCounter(kDatasetType);
+            // TODO(mkuchnik): Note this is off by metadata size
+            const auto bytes_read =
+                out_tensors->back().scalar<tstring>()().size();
             bytes_counter->IncrementBy(
-                out_tensors->back().scalar<tstring>()().size());
+                bytes_read);
+            total_bytes_read_ += bytes_read;
             *end_of_sequence = false;
             return Status::OK();
           }
@@ -133,6 +154,7 @@ class TFRecordDatasetOp::Dataset : public DatasetBase {
             // In case of other errors e.g., DataLoss, we still move forward
             // the file index so that it works with ignore_errors.
             // Otherwise the same file will repeat.
+            total_bytes_read_ = 0;
             ResetStreamsLocked();
             ++current_file_index_;
             return s;
@@ -140,6 +162,7 @@ class TFRecordDatasetOp::Dataset : public DatasetBase {
 
           // We have reached the end of the current file, so maybe move on to
           // next file.
+          total_bytes_read_ = 0;
           ResetStreamsLocked();
           ++current_file_index_;
         }
@@ -215,6 +238,7 @@ class TFRecordDatasetOp::Dataset : public DatasetBase {
 
     mutex mu_;
     size_t current_file_index_ TF_GUARDED_BY(mu_) = 0;
+    int64 total_bytes_read_  TF_GUARDED_BY(mu_) = 0;
 
     // `reader_` will borrow the object that `file_` points to, so
     // we must destroy `reader_` before `file_`.
@@ -225,6 +249,7 @@ class TFRecordDatasetOp::Dataset : public DatasetBase {
   const std::vector<string> filenames_;
   const tstring compression_type_;
   io::RecordReaderOptions options_;
+  int64 estimated_dataset_size_;
 };
 
 TFRecordDatasetOp::TFRecordDatasetOp(OpKernelConstruction* ctx)

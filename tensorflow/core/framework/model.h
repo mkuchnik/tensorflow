@@ -24,6 +24,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "tensorflow/core/framework/graph.pb.h"
 #include "tensorflow/core/framework/metrics.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/gtl/cleanup.h"
@@ -54,6 +55,20 @@ enum class TraversalOrder {
   BFS = 0,
   REVERSE_BFS = 1,
 };
+
+// A convenience function to return the current thread time.
+static timespec thread_clock() {
+  struct timespec res;
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &res);
+  return res;
+}
+
+// Subtract clocks together and return int64 nanoseconds
+static int64 subtract_clock_ns(const timespec& a, const timespec& b) {
+  constexpr auto ns_to_s = 1000000000;
+  int64 res = ns_to_s * (a.tv_sec - b.tv_sec) + (a.tv_nsec - b.tv_nsec);
+  return res;
+}
 
 // Represents thread-safe state that can be shared between an input pipeline and
 // the performance model.
@@ -99,9 +114,28 @@ struct Parameter {
   std::shared_ptr<SharedState> state;
 };
 
+// num_elements / total_time
+typedef std::pair<int64, int64> Rate;
+
+// Used by model to collect runtime stats for analysis
+struct Node_Stats {
+  int64 elements_produced;
+  int64 wallclock_time;
+  int64 processing_time;
+  int64 parallelism;
+  double ratio;
+  int64 count;
+  int64 bytes_produced;
+  int64 bytes_consumed;
+  int64 processing_time_clock;
+  int64 estimated_dataset_size;
+};
+
 std::shared_ptr<Parameter> MakeParameter(const string& name,
                                          std::shared_ptr<SharedState> state,
                                          double min, double max);
+
+class Model;  // Forward declaration for Node pointer
 
 // Abstract representation of a TensorFlow input pipeline node. It collects
 // information about inputs to this node, processing time spent executing the
@@ -129,6 +163,10 @@ class Node {
     int64 id;
     string name;
     std::shared_ptr<Node> output;
+    Model* model;  // Model owns Node
+    string dataset_name;
+    int64 parallelism;
+    int64 estimated_dataset_size;
   };
 
   using Factory = std::function<std::shared_ptr<Node>(Args)>;
@@ -146,9 +184,15 @@ class Node {
         bytes_produced_(0),
         num_elements_(0),
         processing_time_(0),
+        processing_time_clock_(0),
+        start_time_(0),
         record_metrics_(true),
+        parallelism_(args.parallelism),
+        estimated_dataset_size_(args.estimated_dataset_size),
         metrics_(name_),
-        output_(args.output.get()) {}
+        output_(args.output.get()),
+        model_(args.model),
+        dataset_name_(std::move(args.dataset_name)) {}
 
   virtual ~Node() {
     // Clear the sub-nodes instead of relying on implicit shared pointer
@@ -185,6 +229,7 @@ class Node {
   // Increments the aggregate processing time by the given delta.
   void add_processing_time(int64 delta) TF_LOCKS_EXCLUDED(mu_) {
     processing_time_ += delta;
+    processing_time_clock_ += delta;
   }
 
   // Returns an indication whether autotuning is enabled for this node.
@@ -211,6 +256,8 @@ class Node {
   int64 bytes_produced() const TF_LOCKS_EXCLUDED(mu_) {
     return bytes_produced_;
   }
+
+  int64 parallelism() const TF_LOCKS_EXCLUDED(mu_) { return parallelism_; }
 
   // Indicates whether the node has tunable parameters.
   bool has_tunable_parameters() const TF_LOCKS_EXCLUDED(mu_) {
@@ -249,6 +296,18 @@ class Node {
     return processing_time_;
   }
 
+  // Returns the elapsed time.
+  int64 elapsed_time(int64 time_nanos) const TF_LOCKS_EXCLUDED(mu_) {
+    if (start_time_) {
+      int64 elapsed_time = time_nanos - start_time_;
+      return elapsed_time;
+    } else {
+      return 0;
+    }
+  }
+
+  const string& dataset_name() const { return dataset_name_; }
+
   // Records that the node consumed the given number of bytes.
   void record_bytes_consumed(int64 num_bytes) { bytes_consumed_ += num_bytes; }
 
@@ -261,15 +320,28 @@ class Node {
     buffered_elements_ += elements_delta;
   }
 
-  // Records that the node produced an element.
-  void record_element() TF_LOCKS_EXCLUDED(mu_) {
-    num_elements_++;
+  // Records the current node's parallelism.
+  void record_parallelism(int64 parallelism) {
+    VLOG(3) << "Parallelism for " << name() << " is now " << parallelism;
+    parallelism_ = parallelism;
   }
+
+  // Records the current node's size in bytes.
+  void record_estimated_dataset_size_bytes(int64 estimated_bytes) {
+    estimated_dataset_size_ = estimated_bytes;
+  }
+
+  // Records that the node produced an element.
+  void record_element() TF_LOCKS_EXCLUDED(mu_) { num_elements_++; }
 
   // Records that a node thread has started executing.
   void record_start(int64 time_nanos) TF_LOCKS_EXCLUDED(mu_) {
     DCHECK_EQ(work_start_, 0);
     work_start_ = time_nanos;
+    work_start_clock_ = thread_clock();
+    if (!start_time_) {
+      start_time_ = time_nanos;
+    }
   }
 
   // Records that a node thread has stopped executing.
@@ -277,6 +349,9 @@ class Node {
     // TODO(jsimsa): Use DCHECK_NE(work_start_, 0) here.
     if (work_start_ != 0) {
       processing_time_ += time_nanos - work_start_;
+      const auto work_end_clock_ = thread_clock();
+      processing_time_clock_ +=
+          subtract_clock_ns(work_end_clock_, work_start_clock_);
       work_start_ = 0;
     } else {
       VLOG(1) << "Encountered a stop event without a matching start event.";
@@ -359,6 +434,13 @@ class Node {
   double TotalProcessingTime(
       absl::flat_hash_map<string, double>* processing_times)
       TF_LOCKS_EXCLUDED(mu_);
+
+  // Returns the production rates and other statistics of each element in
+  // subtree
+  void CollectProductionStats(
+      absl::flat_hash_map<string, std::shared_ptr<Node_Stats>>&
+          production_stats,
+      int64 time_nanos) TF_LOCKS_EXCLUDED(mu_);
 
  protected:
   // Used for (incrementally) recording metrics. The class is thread-safe.
@@ -467,6 +549,22 @@ class Node {
   // Returns the per-element processing time spent in this node.
   double SelfProcessingTimeLocked() const TF_SHARED_LOCKS_REQUIRED(mu_);
 
+  Rate production_rate_locked(int64 time_nanos) const
+      TF_SHARED_LOCKS_REQUIRED(mu_) {
+    if (start_time_) {
+      if (time_nanos > 0) {
+        int64 elapsed_time = time_nanos - start_time_;
+        return Rate(num_elements_, elapsed_time);
+      } else if (time_nanos == 0) {
+        return Rate(num_elements_, processing_time_);
+      } else {  // -1 is clock
+        return Rate(num_elements_, processing_time_clock_);
+      }
+    } else {
+      return Rate(0, 0);
+    }
+  }
+
   // Computes the per-element CPU time spent in the subtree rooted in this node
   // and stores it in `total_processing_times`. If `processing_times` is not
   // `nullptr`, collects the per-element CPU time spent in each node of the
@@ -475,6 +573,59 @@ class Node {
       absl::flat_hash_map<string, double>* processing_times,
       absl::flat_hash_map<string, double>* total_processing_times)
       TF_SHARED_LOCKS_REQUIRED(mu_) = 0;
+
+  virtual double ElementRatio() const TF_SHARED_LOCKS_REQUIRED(mu_) {
+    // TODO(jsimsa): The current implementation assumes that the number of input
+    // elements consumed per output is the same across all inputs.
+    std::shared_ptr<Node> input = inputs_.front();
+    double ratio = static_cast<double>(input->num_elements()) /
+                   static_cast<double>(num_elements_);
+    return ratio;
+  }
+
+  virtual Rate ElementRate() const TF_SHARED_LOCKS_REQUIRED(mu_) {
+    // TODO(jsimsa): The current implementation assumes that the number of input
+    // elements consumed per output is the same across all inputs.
+    std::shared_ptr<Node> input = inputs_.front();
+    return Rate(input->num_elements(), num_elements_);
+  }
+
+  int64 Parallelism() const TF_SHARED_LOCKS_REQUIRED(mu_) {
+    return parallelism_;
+  }
+
+  int64 EstimatedDatasetSizeBytes() const TF_SHARED_LOCKS_REQUIRED(mu_) {
+    return estimated_dataset_size_;
+  }
+
+  int64 BytesProduced() const TF_SHARED_LOCKS_REQUIRED(mu_) {
+    return bytes_produced_;
+  }
+
+  int64 BytesConsumed() const TF_SHARED_LOCKS_REQUIRED(mu_) {
+    return bytes_consumed_;
+  }
+
+  Node_Stats Stats(int64 time_nanos) const TF_SHARED_LOCKS_REQUIRED(mu_) {
+    Rate abs_rate = production_rate_locked(time_nanos);
+    Rate rate = production_rate_locked(0);
+    Rate clock_rate = production_rate_locked(-1);
+    double ratio = ElementRatio();
+    int64 parallelism = Parallelism();
+    int64 estimated_dataset_size = EstimatedDatasetSizeBytes();
+    Node_Stats stats;
+    stats.elements_produced = rate.first;
+    stats.wallclock_time = abs_rate.second;
+    stats.processing_time = rate.second;
+    stats.parallelism = parallelism;
+    stats.ratio = ratio;
+    stats.count = 1;
+    stats.bytes_produced = BytesProduced();
+    stats.bytes_consumed = BytesConsumed();
+    stats.processing_time_clock = clock_rate.second;
+    stats.estimated_dataset_size = estimated_dataset_size;
+    return stats;
+  }
 
   // Returns a vector of nodes of the subtree rooted in this node. The nodes are
   // either in breadth-first search or reverse breadth-first search order
@@ -516,6 +667,7 @@ class Node {
   // on thread `t`, then `n->record_stop()` must be called before another call
   // to `Node::record_start()` (for any node).
   static thread_local int64 work_start_;  // Will be initialized to zero.
+  static thread_local timespec work_start_clock_;
 
   mutable mutex mu_;
   const int64 id_;
@@ -531,7 +683,11 @@ class Node {
   std::atomic<int64> bytes_produced_;
   std::atomic<int64> num_elements_;
   std::atomic<int64> processing_time_;
+  std::atomic<int64> processing_time_clock_;
+  std::atomic<int64> start_time_;
   std::atomic<bool> record_metrics_;
+  std::atomic<int64> parallelism_;
+  std::atomic<int64> estimated_dataset_size_;
   Metrics metrics_;
   absl::flat_hash_map<string, std::shared_ptr<Parameter>> parameters_
       TF_GUARDED_BY(mu_);
@@ -547,7 +703,9 @@ class Node {
 
   // The reference to the output node is not owned so that deletion of a
   // node results in recursive deletion of the subtree rooted in the node.
-  Node* const output_;
+  Node* const output_;  // TODO(mkuchnik): This can be used to trace parents
+  Model* const model_;
+  const string dataset_name_;
 };
 
 // InterleaveMany is used to model datasets whose inputs are used to create
@@ -595,14 +753,19 @@ std::shared_ptr<Node> MakeUnknownNode(Node::Args args);
 class Model {
  public:
   // Creates a new model.
-  Model() : collect_resource_usage_(false) {}
+  // By default resource collection is off unless autotune params exist.
+  explicit Model(bool collect_resource_usage = false)
+      : collect_resource_usage_(collect_resource_usage) {}
 
   // Indicates whether to collect resource usage.
   bool collect_resource_usage() const { return collect_resource_usage_; }
 
   // Adds a node with the given name and given parent.
+  // dataset_name is from DatasetBase
   void AddNode(Node::Factory factory, const string& name,
-               std::shared_ptr<Node> parent, std::shared_ptr<Node>* out_node)
+               std::shared_ptr<Node> parent, std::shared_ptr<Node>* out_node,
+               const string& dataset_name, const int64 parallelism,
+               const int64 estimated_dataset_size)
       TF_LOCKS_EXCLUDED(mu_);
 
   // Flushes metrics record by the model.
@@ -614,6 +777,12 @@ class Model {
 
   // Removes the given node.
   void RemoveNode(std::shared_ptr<Node> node) TF_LOCKS_EXCLUDED(mu_);
+
+  // Collects statistics on the data pipeline.
+  absl::flat_hash_map<string, std::shared_ptr<Node_Stats>>
+  CollectProductionStats(int64 time_nanos) TF_LOCKS_EXCLUDED(mu_);
+
+  GraphDef graph_def_;
 
  private:
   // Collects tunable parameters in the tree rooted in the given node, returning
@@ -631,6 +800,10 @@ class Model {
       std::shared_ptr<Node> node,
       const absl::flat_hash_map<string, std::shared_ptr<Parameter>>&
           parameters);
+
+  // Collects production rates rooted in the given node.
+  absl::flat_hash_map<string, std::shared_ptr<Node_Stats>>
+  CollectProductionStatsInternal(std::shared_ptr<Node> node, int64 time_nanos);
 
   // This optimization algorithm starts by setting all tunable parallelism
   // parameters to the minimum value. It then repeatedly identifies the

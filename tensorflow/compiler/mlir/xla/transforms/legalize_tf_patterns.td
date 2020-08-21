@@ -436,6 +436,35 @@ def : Pat<(TF_ConstOp:$res ElementsAttr:$value),
           [(HLO_Tensor $res)]>;
 
 //===----------------------------------------------------------------------===//
+// Elu op patterns.
+//===----------------------------------------------------------------------===//
+
+def : Pat<(TF_EluOp AnyRankedTensor:$features),
+          (HLO_SelectOp
+           (HLOClient_BroadcastCompareOp
+              $features,
+              (HLO_ConstOp:$zero (GetScalarOfType<0> $features)),
+              (BinBroadcastDimensions $zero, $features),
+              HLO_COMPARISON_DIRECTION_GT),
+           $features,
+           (HLO_Expm1Op $features))>;
+
+def : Pat<(TF_EluGradOp AnyStaticShapeTensor:$gradients, AnyRankedTensor:$features),
+           (HLO_SelectOp
+            (HLOClient_BroadcastCompareOp
+              $features,
+              (HLO_ConstOp:$zero (GetScalarOfType<0> $features)),
+              (BinBroadcastDimensions $zero, $features),
+              HLO_COMPARISON_DIRECTION_GT),
+            $gradients,
+            (HLO_MulOp
+             $gradients,
+             (HLOClient_BroadcastAddOp
+               $features,
+               (HLO_ConstOp:$one (GetScalarOfType<1> $features)),
+               (BinBroadcastDimensions $one, $features))))>;
+
+//===----------------------------------------------------------------------===//
 // Relu op patterns.
 //===----------------------------------------------------------------------===//
 
@@ -681,5 +710,6 @@ def : Pat<(TF_XlaGatherOp $operand, $start_indices, (TF_ConstOp $slice_sizes),
                           $dimension_numbers, $indices_are_sorted),
           (HLO_GatherOp $operand, $start_indices,
                         (ToGatherDimNumsAttr $dimension_numbers),
-                        $slice_sizes, $indices_are_sorted),
+                        (CastElementsToI64Elements $slice_sizes),
+                        $indices_are_sorted),
           [(HasValidGatherDims $dimension_numbers)]>;

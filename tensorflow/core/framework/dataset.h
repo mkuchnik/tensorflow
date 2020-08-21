@@ -595,6 +595,16 @@ class IteratorBase {
     return GetNext(&ctx, out_tensors, end_of_sequence);
   }
 
+  // Skips the next `num_to_skip` outputs from the range that this iterator
+  // is traversing.
+  //
+  // If there are not enough outputs to skip, it will set
+  // `*end_of_sequence = true` and return `Status::OK()`. `*num_skipped` will
+  // store the number of outputs that are skipped. When `*end_of_sequence` is
+  // `false`, `*num_skipped` should equal to `num_to_skip`.
+  virtual Status Skip(IteratorContext* ctx, int num_to_skip,
+                      bool* end_of_sequence, int* num_skipped) = 0;
+
   // Returns a vector of DataType values, representing the respective
   // element types of each tuple component in the outputs of this
   // iterator.
@@ -743,7 +753,9 @@ class DatasetBase : public core::RefCounted {
   TF_EXPORT static const char kDatasetGraphOutputNodeKey[];
 
   explicit DatasetBase(DatasetContext&& ctx)
-      : type_string_(ctx.type_string()), node_name_(ctx.node_name()) {}
+      : is_root_(false),
+        type_string_(ctx.type_string()),
+        node_name_(ctx.node_name()) {}
 
   // Op type name of this dataset.
   const string& type_string() const { return type_string_; }
@@ -751,6 +763,11 @@ class DatasetBase : public core::RefCounted {
   // Graph node name of this dataset op, uniquely identifying the dataset in
   // the graph.
   const string& node_name() const { return node_name_; }
+
+  void propagate_graphdef_update(const GraphDef& graph_def) {
+    is_root_ = true;
+    graph_def_ = graph_def;
+  }
 
   // Returns a new iterator for iterating over the range of elements in
   // this dataset.
@@ -813,6 +830,22 @@ class DatasetBase : public core::RefCounted {
 
   // A human-readable debug string for this dataset.
   virtual string DebugString() const = 0;
+
+  // The parallelism of the op.
+  virtual int64 Parallelism() const { return 1; }
+
+  // The max bandwidth of the op. Derivative estimator.
+  virtual int64 MaxBandwidthUsed() const { return -1; }
+
+  // The size of the dataset if materialized.
+  virtual int64 EstimatedDatasetSizeBytes() const {
+    return -1;
+  }
+
+  // TODO(mkuchnik): This is hackily used to transmit graph_def to model
+  GraphDef graph_def_;
+
+  bool is_root_;
 
   // Indicates whether the dataset depends on any external state which would
   // prevent it from being serializable. If so, the method returns
@@ -904,6 +937,9 @@ class DatasetBaseIterator : public IteratorBase {
     return GetNext(&ctx, out_tensors, end_of_sequence);
   }
 
+  Status Skip(IteratorContext* ctx, int num_to_skip, bool* end_of_sequence,
+              int* num_skipped) final;
+
   Status Save(SerializationContext* ctx, IteratorStateWriter* writer) final {
     return IteratorBase::Save(ctx, writer);
   }
@@ -913,6 +949,10 @@ class DatasetBaseIterator : public IteratorBase {
   virtual Status GetNextInternal(IteratorContext* ctx,
                                  std::vector<Tensor>* out_tensors,
                                  bool* end_of_sequence) = 0;
+
+  // Internal implementation of Skip that is wrapped in tracing logic
+  virtual Status SkipInternal(IteratorContext* ctx, int num_to_skip,
+                              bool* end_of_sequence, int* num_skipped);
 
   string full_name(const string& name) const {
     if (str_util::StrContains(name, kColon)) {
@@ -946,6 +986,22 @@ class DatasetBaseIterator : public IteratorBase {
   void EnableAutotune(IteratorContext* ctx, IteratorBase* iterator) {
     if (iterator->node_) {
       iterator->node_->set_autotune(true);
+    }
+  }
+
+  // When modeling is enabled, this method records the current parallelism.
+  void RecordParallelism(IteratorContext* ctx) {
+    if (collect_resource_usage(ctx)) {
+      int64 parallelism = dataset()->Parallelism();
+      node_->record_parallelism(parallelism);
+    }
+  }
+
+  // When modeling is enabled, this method records the current dataset size.
+  void RecordEstimatedDatasetSizeBytes(IteratorContext* ctx) {
+    if (collect_resource_usage(ctx)) {
+      int64 estimated_dataset_size = dataset()->EstimatedDatasetSizeBytes();
+      node_->record_estimated_dataset_size_bytes(estimated_dataset_size);
     }
   }
 

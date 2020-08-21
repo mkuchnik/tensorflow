@@ -126,6 +126,10 @@ class MapAndBatchDatasetOp::Dataset : public DatasetBase {
     return name_utils::DatasetDebugString(kDatasetType);
   }
 
+  int64 Parallelism() const override {
+    return num_parallel_calls_;
+  }
+
   int64 Cardinality() const override {
     if (!preserve_cardinality_) {
       return kUnknownCardinality;
@@ -805,6 +809,7 @@ class MapAndBatchDatasetOp::Dataset : public DatasetBase {
   const bool preserve_cardinality_;
   const TraceMeMetadata traceme_metadata_;
 };
+
 
 MapAndBatchDatasetOp::MapAndBatchDatasetOp(OpKernelConstruction* ctx)
     : UnaryDatasetOpKernel(ctx) {

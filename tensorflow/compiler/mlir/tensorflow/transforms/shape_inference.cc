@@ -597,7 +597,7 @@ ShapeInference::ShapeInference(int64_t graph_version, MLIRContext* context,
                                bool propagate_caller_callee_constants)
     : graph_version_(graph_version),
       propagate_caller_callee_constants_(propagate_caller_callee_constants) {
-  tf_dialect_ = context->getRegisteredDialect<TensorFlowDialect>();
+  tf_dialect_ = context->getLoadedDialect<TensorFlowDialect>();
 }
 
 ShapeHandle ShapeInference::ComputeOutputAsShape(OpResult result,
@@ -1175,7 +1175,7 @@ LogicalResult ShapeInference::TryToFold(Operation* op) {
     auto* interface = dialect->getRegisteredInterface<DialectFoldInterface>();
     if (!interface) return failure();
 
-    if (failed(interface->Fold(op, constant_operands, fold_results)))
+    if (failed(interface->fold(op, constant_operands, fold_results)))
       return failure();
   }
 
